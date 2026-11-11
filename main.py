@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""Roblox Up-and-Coming top-10 forecaster (make.fun program/v1).
+"""Roblox Up-and-Coming top-10 forecaster v2 (make.fun program/v1).
 
 Reads the chart history at $MAKEFUN_INPUT_DIR (default /input) and writes
 /output/forecast.json (or $MAKEFUN_OUTPUT_DIR/forecast.json).
 
-Model: drift-diffusion over rank.
+Model: drift-diffusion over rank + playing-spike surge + uniform floor.
 - Each game's current rank is its last-snapshot rank.
 - Drift comes from chart-age: games that just entered the chart climb fast
   (mean +8.7 ranks over ~3 snapshots), old games fall. The empirical
   age-drift table was measured on the kit's practice history.
 - Rank velocity from individual trajectories was tested and found to be
   pure noise (corr ~0.02), so it is NOT used.
-- Playing-count surge was tested and found to add nothing beyond age, so
-  it is NOT used.
+- SURGE: a game's concurrent-player count spiking (>=3x its own median
+  over the previous 3 snapshots) is a real leading indicator of a
+  top-10 entry: measured on the kit history, spike>=2.0 games hit the
+  top 10 within 72h 27% of the time (base rate 4%), and spike>=1.5
+  17% of the time. The surge component gives extra probability mass
+  to spiking games, spread over places by the empirical landing-place
+  distribution (bimodal: places 1-2 and 7-10). This is what the v1
+  model missed: in the practice window the two biggest spikers
+  (Sweep The Moon 7.15x, Impact Lab 3.44x) shot to places 1-3 and
+  7-10, but v1 gave them ~0.003 probability each.
+- FLOOR: a small uniform mixture (12%) over the 15 most likely
+  candidates guards against overconfident Gaussian tails.
 - The predicted rank at time t is r0 + drift * tau * (1 - exp(-t/tau))
   (mean-reverting drift), with Gaussian uncertainty growing as
   sqrt(s0^2 + diff^2 * t). Probabilities per place come from the Gaussian
@@ -33,12 +43,21 @@ from datetime import datetime
 S0 = 1.5            # base rank std at t=0
 DIFF = 0.7          # diffusion rate (std grows as DIFF * sqrt(t))
 UNNAMED = 0.25      # unnamed share per place
-MIN_P = 0.008       # minimum probability to include a row
+MIN_P = 0.004       # minimum probability to include a row
 MAX_RANK = 100      # candidate games: last-chart rank <= MAX_RANK
 AGE_WEIGHT = 2.0    # multiplier on the empirical age drift
 AGE_TAU = 12.0      # mean-reversion time constant for drift (hours)
 TIME_DECAY = 48.0   # time-weight decay (hours); 0 = uniform
 SAMPLE_TIMES = [0, 3, 6, 9, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72]
+FLOOR_W = 0.12      # uniform-floor mixture weight over top candidates
+FLOOR_TOPN = 15     # candidates (by expected rank) in the floor
+SURGE_W = 0.7       # total top-10 mass for a max-strength surge game
+SURGE_THRESH = 3.0  # playing spike (vs own median prev 3 snaps) to count
+SURGE_CAP = 5.0     # spike capped here for strength (strength 1.0)
+# Empirical landing-place distribution for surge games that hit the top 10
+# (smoothed counts from the kit history, 72h horizon).
+SURGE_PLACE_W = {1: 0.21, 2: 0.11, 3: 0.04, 4: 0.02, 5: 0.02,
+                 6: 0.11, 7: 0.11, 8: 0.06, 9: 0.17, 10: 0.15}
 
 # Empirical mean rank change (ranks/hour, negative = climbing) by chart-age
 # in snapshots since first appearance on the chart. Measured on the kit's
@@ -115,6 +134,7 @@ def build_forecast(snaps, task):
     snaps = [s for _, s in paired]
 
     rank_series = defaultdict(list)
+    play_series = defaultdict(dict)  # uid -> {snap_index: playing}
     first_appear = {}
     for i, s in enumerate(snaps):
         for r in s.get("up_and_coming") or []:
@@ -124,6 +144,12 @@ def build_forecast(snaps, task):
             except (KeyError, TypeError, ValueError):
                 continue
             rank_series[uid].append(rk)
+            try:
+                pl = r.get("playing")
+                if pl is not None:
+                    play_series[uid][i] = float(pl)
+            except (TypeError, ValueError):
+                pass
             if uid not in first_appear:
                 first_appear[uid] = i
     last = snaps[-1]
@@ -159,6 +185,28 @@ def build_forecast(snaps, task):
     if not candidates:
         return {"probabilities": [], "top10": []}
 
+    # ---- playing-spike surge strength per candidate -------------------
+    # spike = playing at last snapshot / median playing over previous 3
+    strength = {}
+    last_idx = n_snaps - 1
+    for uid in candidates:
+        d = play_series.get(uid, {})
+        if last_idx not in d:
+            continue
+        pl = d[last_idx]
+        prev = sorted(d[j] for j in range(max(0, last_idx - 3), last_idx)
+                      if j in d)
+        if not prev or pl <= 0:
+            continue
+        med = prev[len(prev) // 2]
+        if med <= 0:
+            continue
+        spike = pl / med
+        if spike >= SURGE_THRESH:
+            strength[uid] = min((spike - SURGE_THRESH)
+                                / (SURGE_CAP - SURGE_THRESH), 1.0)
+
+    # ---- base drift-diffusion scores ----------------------------------
     score = {uid: [0.0] * (places + 1) for uid in candidates}
     exp_rank = {}
     for uid in candidates:
@@ -180,22 +228,65 @@ def build_forecast(snaps, task):
                 score[uid][k] += w * gauss_pdf(k, mu, sig)
         exp_rank[uid] = tot / len(SAMPLE_TIMES)
 
-    probs = []
+    # normalize base per place to the named mass
+    base = {uid: [0.0] * (places + 1) for uid in candidates}
     for k in range(1, places + 1):
         tot = sum(score[uid][k] for uid in candidates)
         if tot <= 0:
             continue
         target = 1.0 - UNNAMED
-        rows = []
         for uid in candidates:
-            p = score[uid][k] / tot * target
-            if p >= MIN_P:
-                rows.append({"universe_id": uid, "place": k, "p": round(p, 6)})
+            base[uid][k] = score[uid][k] / tot * target
+
+    # ---- mix in the surge component (per place, keep total = named) ---
+    final = {uid: [0.0] * (places + 1) for uid in candidates}
+    for k in range(1, places + 1):
+        surge = {}
+        s_tot = 0.0
+        for uid in candidates:
+            st = strength.get(uid, 0.0)
+            if st > 0:
+                v = SURGE_W * st * SURGE_PLACE_W.get(k, 0.1)
+                surge[uid] = v
+                s_tot += v
+        named_mass = 1.0 - UNNAMED
+        # cap surge mass at 60% of the named mass so the base is not destroyed
+        if s_tot > 0.6 * named_mass:
+            scale = 0.6 * named_mass / s_tot
+            for uid in surge:
+                surge[uid] *= scale
+            s_tot = 0.6 * named_mass
+        for uid in candidates:
+            final[uid][k] = (base[uid][k] * (1.0 - s_tot / named_mass)
+                             + surge.get(uid, 0.0))
+
+    ranked = sorted(candidates, key=lambda u: exp_rank[u])
+    floor_set = set(ranked[:FLOOR_TOPN]) if FLOOR_W > 0 else set()
+
+    probs = []
+    for k in range(1, places + 1):
+        tot = sum(final[uid][k] for uid in candidates)
+        if tot <= 0:
+            continue
+        target = tot
+        rows = []
+        if floor_set:
+            uni = target / len(floor_set)
+            for uid in candidates:
+                p = ((1.0 - FLOOR_W) * final[uid][k]
+                     + (FLOOR_W * uni if uid in floor_set else 0.0))
+                if p >= MIN_P:
+                    rows.append({"universe_id": uid, "place": k,
+                                 "p": round(p, 6)})
+        else:
+            for uid in candidates:
+                if final[uid][k] >= MIN_P:
+                    rows.append({"universe_id": uid, "place": k,
+                                 "p": round(final[uid][k], 6)})
         # at most 100 rows per place; keep the largest
         rows.sort(key=lambda r: -r["p"])
         probs.extend(rows[:100])
 
-    ranked = sorted(candidates, key=lambda u: exp_rank[u])
     top10 = ranked[:places]
     if len(top10) < places:
         for uid in last_chart:
