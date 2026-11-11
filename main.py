@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Roblox Up-and-Coming top-10 forecaster v2 (make.fun program/v1).
 
+Resubmission: transcripts rebuilt with fixed tool-call ids (2026-11-11).
+
 Reads the chart history at $MAKEFUN_INPUT_DIR (default /input) and writes
 /output/forecast.json (or $MAKEFUN_OUTPUT_DIR/forecast.json).
 
